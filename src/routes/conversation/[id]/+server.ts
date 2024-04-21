@@ -1,4 +1,9 @@
-import { MESSAGES_BEFORE_LOGIN, ENABLE_ASSISTANTS_RAG } from "$env/static/private";
+import {
+	MESSAGES_BEFORE_LOGIN,
+	ENABLE_ASSISTANTS_RAG,
+	HF_TOKEN,
+	HF_ACCESS_TOKEN,
+} from "$env/static/private";
 import { startOfHour } from "date-fns";
 import { authCondition, requiresUser } from "$lib/server/auth";
 import { collections } from "$lib/server/database";
@@ -23,6 +28,11 @@ import { addSibling } from "$lib/utils/tree/addSibling.js";
 import { preprocessMessages } from "$lib/server/preprocessMessages.js";
 import { usageLimits } from "$lib/server/usageLimits";
 import { isURLLocal } from "$lib/server/isURLLocal.js";
+import { getToolsFromFunctionSpec } from "$lib/utils/getToolsFromFunctionSpec.js";
+import JSON5 from "json5";
+import type { Call, ToolResult } from "$lib/types/Tool.js";
+import { HfInference } from "@huggingface/inference";
+import { v4 } from "uuid";
 
 export async function POST({ request, locals, params, getClientAddress }) {
 	const id = z.string().parse(params.id);
@@ -339,10 +349,10 @@ export async function POST({ request, locals, params, getClientAddress }) {
 
 			// check if assistant has a rag
 			const assistant = await collections.assistants.findOne<
-				Pick<Assistant, "rag" | "dynamicPrompt" | "generateSettings">
+				Pick<Assistant, "rag" | "dynamicPrompt" | "generateSettings" | "functionSpec">
 			>(
 				{ _id: conv.assistantId },
-				{ projection: { rag: 1, dynamicPrompt: 1, generateSettings: 1 } }
+				{ projection: { rag: 1, dynamicPrompt: 1, generateSettings: 1, functionSpec: 1 } }
 			);
 
 			const assistantHasDynamicPrompt =
@@ -356,14 +366,18 @@ export async function POST({ request, locals, params, getClientAddress }) {
 					assistant.rag.allowedDomains.length > 0 ||
 					assistant.rag.allowAllDomains);
 
-			// perform websearch if needed
-			if (!isContinue && (webSearch || assistantHasWebSearch)) {
-				messageToWriteTo.webSearch = await runWebSearch(
-					conv,
-					messagesForPrompt,
-					update,
-					assistant?.rag
-				);
+			// perform websearch if requested
+			// it can be because the user toggled the webSearch or because the assistant has webSearch enabled
+			// if the assistant is functions enabled, we don't perform it here
+			// since we will add the websearch as a tool
+
+			if (
+				!isContinue &&
+				((webSearch && !conv.assistantId) || (assistantHasWebSearch && !model.functions))
+			) {
+				messageToWriteTo.webSearch = await runWebSearch(conv, messagesForPrompt, update, {
+					ragSettings: assistant?.rag,
+				});
 			}
 
 			let preprompt = conv.preprompt;
@@ -396,6 +410,170 @@ export async function POST({ request, locals, params, getClientAddress }) {
 				}
 			}
 
+			const endpoint = await model.getEndpoint();
+			let toolResults: ToolResult[] | undefined = undefined;
+
+			// function calls
+			if (model.functions && (assistant?.functionSpec || assistantHasWebSearch)) {
+				// turn functionSpec into a list of tools
+
+				let tools = await getToolsFromFunctionSpec(assistant?.functionSpec);
+
+				// remove websearch tool if relevant
+				if (!assistantHasWebSearch) {
+					tools = tools.filter(({ name }) => name !== "websearch");
+				}
+				let calls: Call[] | undefined = undefined;
+
+				// do the function calling bits here
+				for await (const output of await endpoint({
+					messages: messagesForPrompt,
+					preprompt,
+					generateSettings: assistant?.generateSettings,
+					tools,
+				})) {
+					console.log(output.generated_text)
+					if (output.generated_text) {
+						let codeBlocks = null
+						if (model.name.includes("Ollama-Llama3-fn-calling")) {
+							codeBlocks = ['[\n'+output.generated_text.trimStart().replace(/'/g, '').replace(/"arguments"/g, '"parameters"').replace(/"name"/g, '"tool_name"')+'\n]'];
+						}
+						else {
+							// look for a code blocks of ```json and parse them
+							// if they're valid json, add them to the calls array
+							codeBlocks = output.generated_text.match(/```json\n(.*?)```/gs);
+						}
+						
+						
+						if (codeBlocks) {
+							for (const block of codeBlocks) {
+								try {
+									if (model.name.includes("Ollama-Llama3-fn-calling")) {
+										calls = JSON5.parse(block);
+									}
+									else {
+										calls = JSON5.parse(block.replace("```json\n", "").slice(0, -3));
+									}
+									
+								} catch (e) {
+									update({
+										type: "error",
+										message: (e as Error).message,
+										name: (e as Error).name,
+									});
+									console.error(e);
+									// error parsing the calls
+								}
+							}
+						}
+					}
+				}
+
+				const toolPromises = calls?.map(async (call) => {
+					const uuid = v4();
+
+					if (call.tool_name === "directly-answer" || call.tool_name === "directly_answer") {
+						return null;
+					}
+
+					update({
+						type: "tool",
+						name: call.tool_name,
+						messageType: "parameters",
+						parameters: call.parameters,
+						uuid,
+					});
+					const tool = tools.find((el) => el.name === call.tool_name);
+
+					let toolAnswer: ToolResult | Promise<ToolResult> | null = (async () => {
+						if (!tool) {
+							return {
+								key: call.tool_name,
+								status: "error",
+								value: "Could not find tool",
+							};
+						}
+
+						if (tool.call) {
+							return await tool.call(call.parameters);
+						}
+
+						if (tool.name === "websearch") {
+							try {
+								const webSearchToolResults = await runWebSearch(conv, messagesForPrompt, update, {
+									ragSettings: assistant?.rag,
+									query: call.parameters?.query,
+								});
+								const chunks = webSearchToolResults?.contextSources
+									.map(({ context }) => context)
+									.flat()
+									.sort((a, b) => a.idx - b.idx)
+									.map(({ text }) => text)
+									.join(" ");
+
+								return {
+									key: call.tool_name,
+									status: "success",
+									value: chunks,
+								};
+							} catch (e) {
+								return {
+									key: call.tool_name,
+									status: "error",
+									value: "Error within the websearch. Try again later or with a different query",
+								};
+							}
+						} else if (tool.name === "text2img") {
+							const inference = new HfInference(HF_TOKEN ?? HF_ACCESS_TOKEN);
+							const img = await inference.textToImage({
+								model: "runwayml/stable-diffusion-v1-5",
+								inputs: call.parameters?.prompt,
+							});
+
+							const sha = await uploadFile(img, conv);
+
+							messageToWriteTo.files = [...(messageToWriteTo.files ?? []), sha];
+
+							update({
+								type: "file",
+								sha,
+							});
+
+							return {
+								key: call.tool_name,
+								status: "success",
+								value: `An image has been generated for the following prompt: ${call.parameters?.prompt}. Answer as if the user can already see the image. Do not try to insert the image or to add space for it. The user can already see the image. Do not try to describe the image as you the model cannot see it.`,
+							};
+						} else {
+							return {
+								key: call.tool_name,
+								status: "error",
+								value: "Not implemented",
+							};
+						}
+					})();
+
+					if (toolAnswer instanceof Promise) {
+						toolAnswer = await toolAnswer;
+					}
+
+					if (toolAnswer) {
+						update({
+							type: "tool",
+							name: toolAnswer.key,
+							messageType: "message",
+							message: toolAnswer.value,
+							uuid,
+						});
+					}
+					return toolAnswer;
+				});
+
+				if (toolPromises) {
+					toolResults = (await Promise.all(toolPromises)).flatMap((el) => (el ? [el] : []));
+				}
+			}
+			console.log(toolResults)
 			// inject websearch result & optionally images into the messages
 			const processedMessages = await preprocessMessages(
 				messagesForPrompt,
@@ -403,6 +581,7 @@ export async function POST({ request, locals, params, getClientAddress }) {
 				model.multimodal,
 				convId
 			);
+			console.log(processedMessages)
 
 			const previousText = messageToWriteTo.content;
 
@@ -411,12 +590,12 @@ export async function POST({ request, locals, params, getClientAddress }) {
 			let buffer = "";
 
 			try {
-				const endpoint = await model.getEndpoint();
 				for await (const output of await endpoint({
 					messages: processedMessages,
 					preprompt,
 					continueMessage: isContinue,
 					generateSettings: assistant?.generateSettings,
+					toolResults,
 				})) {
 					// if not generated_text is here it means the generation is not done
 					if (!output.generated_text) {
@@ -466,6 +645,7 @@ export async function POST({ request, locals, params, getClientAddress }) {
 			} catch (e) {
 				hasError = true;
 				update({ type: "status", status: "error", message: (e as Error).message });
+				console.error(e);
 			} finally {
 				// check if no output was generated
 				if (!hasError && messageToWriteTo.content === previousText) {

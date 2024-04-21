@@ -21,12 +21,16 @@ import endpointLangserve, {
 	endpointLangserveParametersSchema,
 } from "./langserve/endpointLangserve";
 
+import type { Tool, ToolResult } from "$lib/types/Tool";
+
 // parameters passed when generating text
 export interface EndpointParameters {
 	messages: Omit<Conversation["messages"][0], "id">[];
 	preprompt?: Conversation["preprompt"];
 	continueMessage?: boolean; // used to signal that the last message will be extended
 	generateSettings?: Partial<Model["parameters"]>;
+	tools?: Tool[];
+	toolResults?: ToolResult[];
 }
 
 interface CommonEndpoint {

@@ -39,6 +39,7 @@
 	let systemPrompt = assistant?.preprompt ?? "";
 	let dynamicPrompt = assistant?.dynamicPrompt ?? false;
 	let showModelSettings = Object.values(assistant?.generateSettings ?? {}).some((v) => !!v);
+	let functionSpec = assistant?.functionSpec ?? "";
 
 	let compress: typeof readAndCompressImage | null = null;
 
@@ -96,6 +97,19 @@
 	const regex = /{{\s?url=(.+?)\s?}}/g;
 	$: templateVariables = [...systemPrompt.matchAll(regex)].map((match) => match[1]);
 	$: selectedModel = models.find((m) => m.id === modelId);
+
+	// const getErrorsFromSpec = debounce(async (spec: string) => {
+	// 	if (parser && spec) {
+	// 		// disable ts
+	// 		parser.validate(spec, (err) => {
+	// 			if (err && form) {
+	// 				form.errors = [{ field: "functionSpec", message: err.message }];
+	// 			}
+	// 		});
+	// 	}
+	// }, 500);
+
+	// $: getErrorsFromSpec(functionSpec);
 </script>
 
 <form
@@ -519,6 +533,16 @@
 							each inference.
 						</p>
 					</label>
+
+					<div class="my-3 ml-0 mr-6 w-full border border-gray-200" />
+					<span class="mt-2 text-smd font-semibold">Function calling </span>
+					<input
+						type="text"
+						class="w-full rounded-lg border-2 border-gray-200 bg-gray-100 p-2"
+						name="functionSpec"
+						bind:value={functionSpec}
+					/>
+					<p class="text-xs text-red-500">{getError("functionSpec", form)}</p>
 				</div>
 			{/if}
 		</div>

@@ -21,9 +21,10 @@
 	import type { Model } from "$lib/types/Model";
 
 	import OpenWebSearchResults from "../OpenWebSearchResults.svelte";
-	import type { WebSearchUpdate } from "$lib/types/MessageUpdate";
+	import type { ToolUpdate, WebSearchUpdate } from "$lib/types/MessageUpdate";
 	import { base } from "$app/paths";
 	import { useConvTreeStore } from "$lib/stores/convTree";
+	import Modal from "../Modal.svelte";
 
 	function sanitizeMd(md: string) {
 		let ret = md
@@ -57,6 +58,8 @@
 	export let isTapped = false;
 
 	$: message = messages.find((m) => m.id === id) ?? ({} as Message);
+
+	$: urlNotTrailing = $page.url.pathname.replace(/\/$/, "");
 
 	const dispatch = createEventDispatcher<{
 		retry: { content?: string; id: Message["id"] };
@@ -131,8 +134,20 @@
 	$: searchUpdates = (message.updates?.filter(({ type }) => type === "webSearch") ??
 		[]) as WebSearchUpdate[];
 
-	$: downloadLink =
-		message.from === "user" ? `${$page.url.pathname}/message/${message.id}/prompt` : undefined;
+	// filter all updates with type === "tool" then group them by uuid field
+
+	$: tools = message.updates
+		?.filter(({ type }) => type === "tool")
+		?.reduce((acc, update) => {
+			if (update.type !== "tool") {
+				return acc;
+			}
+			acc[update.uuid] = acc[update.uuid] ?? [];
+			acc[update.uuid].push(update);
+			return acc;
+		}, {} as Record<string, ToolUpdate[]>);
+
+	$: downloadLink = urlNotTrailing + `/message/${message.id}/prompt`;
 
 	let webSearchIsDone = true;
 
@@ -177,7 +192,29 @@
 	const convTreeStore = useConvTreeStore();
 
 	$: if (message.children?.length === 0) $convTreeStore.leaf = message.id;
+
+	$: modalImageToShow = "";
 </script>
+
+{#if modalImageToShow}
+	<!-- show the image file full screen, click outside to exit -->
+	<Modal on:close={() => (modalImageToShow = "")}>
+		{#if modalImageToShow.length === 64}
+			<img
+				src={urlNotTrailing + "/output/" + modalImageToShow}
+				alt="input from user"
+				class="aspect-auto"
+			/>
+		{:else}
+			<!-- handle the case where this is a base64 encoded image -->
+			<img
+				src={"data:image/*;base64," + modalImageToShow}
+				alt="input from user"
+				class="aspect-auto"
+			/>
+		{/if}
+	</Modal>
+{/if}
 
 {#if message.from === "assistant"}
 	<div
@@ -202,11 +239,69 @@
 		<div
 			class="relative min-h-[calc(2rem+theme(spacing[3.5])*2)] min-w-[60px] break-words rounded-2xl border border-gray-100 bg-gradient-to-br from-gray-50 px-5 py-3.5 text-gray-600 prose-pre:my-2 dark:border-gray-800 dark:from-gray-800/40 dark:text-gray-300"
 		>
+			{#if message.files && message.files.length > 0}
+				<div class="grid w-fit grid-cols-2 gap-5">
+					{#each message.files as file}
+						<!-- handle the case where this is a hash that points to an image in the db, hash is always 64 char long -->
+						<button on:click={() => (modalImageToShow = file)}>
+							{#if file.length === 64}
+								<img
+									src={urlNotTrailing + "/output/" + file}
+									alt="output from assistant"
+									class="my-2 aspect-auto max-h-48 cursor-pointer rounded-lg shadow-lg"
+								/>
+							{:else}
+								<!-- handle the case where this is a base64 encoded image -->
+								<img
+									src={"data:image/*;base64," + file}
+									alt="output from assistant"
+									class="my-2 aspect-auto max-h-48 cursor-pointer rounded-lg shadow-lg"
+								/>
+							{/if}
+						</button>
+					{/each}
+				</div>
+			{/if}
 			{#if searchUpdates && searchUpdates.length > 0}
 				<OpenWebSearchResults
 					classNames={tokens.length ? "mb-3.5" : ""}
 					webSearchMessages={searchUpdates}
 				/>
+			{/if}
+
+			{#if tools}
+				{#each Object.values(tools) as tool}
+					{#if tool.length > 0}
+						{@const toolName = tool.filter((t) => t.messageType === "parameters")[0].name}
+						{#if toolName}
+							<details
+								class="border-1 group/tool mb-3 w-fit cursor-pointer rounded-xl border-purple-800/50 bg-purple-800/20 p-3 text-purple-700 transition-all dark:border-purple-800/70 dark:bg-purple-800/30 dark:text-purple-300"
+							>
+								<summary class="pb-1 text-purple-700 transition-all dark:text-purple-300">
+									Calling tool <span class="font-mono font-bold">{toolName}</span>
+								</summary>
+								{#each tool as toolUpdate}
+									<div class="my-1 w-full border-b-2 border-purple-500/50" />
+									{#if toolUpdate.messageType === "parameters"}
+										<h3 class="font-bold">Parameters:</h3>
+										<ul class="list-inside list-disc">
+											{#each Object.entries(toolUpdate.parameters ?? {}) as [k, v]}
+												<li>
+													<span class="font-mono">{k}</span>: <span class="font-bold">{v}</span>
+												</li>
+											{/each}
+										</ul>
+									{:else if toolUpdate.messageType === "message"}
+										<h3 class="font-bold">Result:</h3>
+										<p class="pb-1 pt-1 font-mono">
+											{" > "}{toolUpdate.message}
+										</p>
+									{/if}
+								{/each}
+							</details>
+						{/if}
+					{/if}
+				{/each}
 			{/if}
 
 			<div
@@ -244,7 +339,7 @@
 				</div>
 			{/if}
 		</div>
-		{#if !loading && message.content}
+		{#if !loading && (message.content || tools)}
 			<div
 				class="absolute bottom-1 right-0 -mb-4 flex max-md:transition-all md:bottom-0 md:group-hover:visible md:group-hover:opacity-100
 		{message.score ? 'visible opacity-100' : 'invisible max-md:-translate-y-4 max-md:opacity-0'}
@@ -308,21 +403,22 @@
 			{#if message.files && message.files.length > 0}
 				<div class="mx-auto grid w-fit grid-cols-2 gap-5 px-5">
 					{#each message.files as file}
-						<!-- handle the case where this is a hash that points to an image in the db, hash is always 64 char long -->
-						{#if file.length === 64}
-							<img
-								src={$page.url.pathname + "/output/" + file}
-								alt="input from user"
-								class="my-2 aspect-auto max-h-48 rounded-lg shadow-lg"
-							/>
-						{:else}
-							<!-- handle the case where this is a base64 encoded image -->
-							<img
-								src={"data:image/*;base64," + file}
-								alt="input from user"
-								class="my-2 aspect-auto max-h-48 rounded-lg shadow-lg"
-							/>
-						{/if}
+						<button on:click={() => (modalImageToShow = file)}>
+							{#if file.length === 64}
+								<img
+									src={urlNotTrailing + "/output/" + file}
+									alt="input from user"
+									class="my-2 aspect-auto max-h-48 cursor-pointer rounded-lg shadow-lg"
+								/>
+							{:else}
+								<!-- handle the case where this is a base64 encoded image -->
+								<img
+									src={"data:image/*;base64," + file}
+									alt="input from user"
+									class="my-2 aspect-auto max-h-48 cursor-pointer rounded-lg shadow-lg"
+								/>
+							{/if}
+						</button>
 					{/each}
 				</div>
 			{/if}

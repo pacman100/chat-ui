@@ -1,3 +1,4 @@
+import type { Call, Tool } from "./Tool";
 import type { WebSearchSource } from "./WebSearch";
 
 export type FinalAnswer = {
@@ -10,12 +11,23 @@ export type TextStreamUpdate = {
 	token: string;
 };
 
-export type AgentUpdate = {
-	type: "agent";
-	agent: string;
-	content: string;
-	binary?: Blob;
-};
+interface ToolUpdateBase {
+	type: "tool";
+	name: Tool["name"];
+	uuid: string;
+}
+
+interface ToolUpdateParams extends ToolUpdateBase {
+	messageType: "parameters";
+	parameters: Call["parameters"];
+}
+
+interface ToolUpdateMessage extends ToolUpdateBase {
+	messageType: "message";
+	message?: string;
+}
+
+export type ToolUpdate = ToolUpdateParams | ToolUpdateMessage;
 
 export type WebSearchUpdate = {
 	type: "webSearch";
@@ -37,10 +49,16 @@ export type ErrorUpdate = {
 	name: string;
 };
 
+export type FileUpdate = {
+	type: "file";
+	sha: string;
+};
+
 export type MessageUpdate =
 	| FinalAnswer
 	| TextStreamUpdate
-	| AgentUpdate
+	| ToolUpdate
 	| WebSearchUpdate
 	| StatusUpdate
-	| ErrorUpdate;
+	| ErrorUpdate
+	| FileUpdate;

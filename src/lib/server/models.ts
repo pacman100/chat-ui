@@ -67,6 +67,7 @@ const modelConfig = z.object({
 		.passthrough()
 		.optional(),
 	multimodal: z.boolean().default(false),
+	functions: z.boolean().default(false),
 	unlisted: z.boolean().default(false),
 	embeddingModel: validateEmbeddingModelByName(embeddingModels).optional(),
 });
@@ -99,7 +100,7 @@ async function getChatPromptRender(
 		);
 	}
 
-	const renderTemplate = ({ messages, preprompt }: ChatTemplateInput) => {
+	const renderTemplate = ({ messages, preprompt, tools, toolResults }: ChatTemplateInput) => {
 		let formattedMessages: { role: string; content: string }[] = messages.map((message) => ({
 			content: message.content,
 			role: message.from,
@@ -115,10 +116,53 @@ async function getChatPromptRender(
 			];
 		}
 
+		if (toolResults && toolResults.length > 0) {
+			if (m.name.includes("Ollama-Llama3-fn-calling")) {
+				formattedMessages = [
+					...formattedMessages,
+					{
+						role: "function-response",
+						content:
+							toolResults
+								.map((result, idx) => `{result: ${result.value}}`)
+								.join("\n")
+					},
+				];
+				console.log(formattedMessages)
+			}
+			else {
+				formattedMessages = [
+					...formattedMessages,
+					{
+						role: "system",
+						content:
+							"<results>" +
+							toolResults
+								.map((result, idx) => `\nDocument: ${idx}\n${result.key}\n${result.value}`)
+								.join("\n") +
+							"\n</results>",
+					},
+				];
+			}
+			tools = [];
+		}
+
+		let chatTemplate: string | undefined = undefined;
+
+		if ((tools?.length ?? 0) > 0) {
+			chatTemplate = "tool_use";
+		}
+
+		console.log(tokenizer.chat_template)
 		const output = tokenizer.apply_chat_template(formattedMessages, {
 			tokenize: false,
 			add_generation_prompt: true,
+			chat_template: chatTemplate,
+			// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+			// @ts-ignore
+			tools: tools ?? [],
 		});
+		console.log(output)
 
 		if (typeof output !== "string") {
 			throw new Error("Failed to apply chat template, the output is not a string");
