@@ -14,12 +14,13 @@ export const endpointOllamaParametersSchema = z.object({
 export function endpointOllama(input: z.input<typeof endpointOllamaParametersSchema>): Endpoint {
 	const { url, model, ollamaName } = endpointOllamaParametersSchema.parse(input);
 
-	return async ({ messages, preprompt, continueMessage, generateSettings, toolResults }) => {
+	return async ({ messages, preprompt, continueMessage, generateSettings, tools, toolResults }) => {
 		const prompt = await buildPrompt({
 			messages,
 			continueMessage,
 			preprompt,
 			model,
+			tools,
 			toolResults,
 		});
 
